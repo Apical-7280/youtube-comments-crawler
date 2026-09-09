@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Example Video - YouTube</title></head>
+<body>
+  <!--
+    YouTube 评论区结构快照（脱敏）。
+    三条正文内容完全相同，但作者/时间不同 —— 用于验证去重键必须是「作者 + 时间 + 正文」，
+    否则会被静默合并成一条。按钮文案与评论区标题使用同一类 span，必须被排除。
+  -->
+  <ytd-comments>
+    <ytd-comments-header-renderer>
+      <h2><span class="ytAttributedStringHost ytAttributedStringWhiteSpacePreWrap" dir="auto" role="text">Comments</span></h2>
+    </ytd-comments-header-renderer>
+
+    <!-- 线程一：主评论 Alice + 回复 Bob（正文与主评论相同） -->
+    <ytd-comment-thread-renderer>
+      <ytd-comment-renderer>
+        <div id="header-author">
+          <a id="author-text" href="/@alice">Alice</a>
+          <span id="published-time-text">3 days ago</span>
+        </div>
+        <yt-attributed-string>
+          <span class="ytAttributedStringHost ytAttributedStringWhiteSpacePreWrap" dir="auto" role="text">Great video</span>
+        </yt-attributed-string>
+        <ytd-comment-action-buttons-renderer>
+          <yt-button-shape>
+            <button><span class="ytAttributedStringHost ytAttributedStringWhiteSpacePreWrap" dir="auto" role="text">Reply</span></button>
+          </yt-button-shape>
+        </ytd-comment-action-buttons-renderer>
+        <span id="vote-count-middle">12</span>
+      </ytd-comment-renderer>
+
+      <ytd-comment-replies-renderer>
+        <ytd-comment-renderer>
+          <div id="header-author">
+            <a id="author-text" href="/@bob">Bob</a>
+            <span id="published-time-text">2 days ago</span>
+          </div>
+          <yt-attributed-string>
+            <span class="ytAttributedStringHost ytAttributedStringWhiteSpacePreWrap" dir="auto" role="text">Great video</span>
+          </yt-attributed-string>
+          <span id="vote-count-middle">3</span>
+        </ytd-comment-renderer>
+        <yt-button-shape>
+          <button><span class="ytAttributedStringHost ytAttributedStringWhiteSpacePreWrap" dir="auto" role="text">1 reply</span></button>
+        </yt-button-shape>
+      </ytd-comment-replies-renderer>
+    </ytd-comment-thread-renderer>
+
+    <!-- 线程二：主评论 Carol，点赞数为缩写写法 -->
+    <ytd-comment-thread-renderer>
+      <ytd-comment-renderer>
+        <div id="header-author">
+          <a id="author-text" href="/@carol">Carol</a>
+          <span id="published-time-text">1 day ago</span>
+        </div>
+        <yt-attributed-string>
+          <span class="ytAttributedStringHost ytAttributedStringWhiteSpacePreWrap" dir="auto" role="text">Great video</span>
+        </yt-attributed-string>
+        <span id="vote-count-middle">1.2K</span>
+      </ytd-comment-renderer>
+    </ytd-comment-thread-renderer>
+  </ytd-comments>
+</body>
+</html>

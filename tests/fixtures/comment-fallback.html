@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Example Video - YouTube</title></head>
+<body>
+  <!--
+    没有 ytd-comment-thread-renderer 的兜底结构：脚本会走「评论区容器内同类节点」的兜底分支。
+    主评论模式下必须排除回复容器内的节点（旧实现漏掉了这一步）。
+  -->
+  <ytd-comments>
+    <ytd-comments-header-renderer>
+      <h2><span class="ytAttributedStringHost ytAttributedStringWhiteSpacePreWrap" dir="auto" role="text">Comments</span></h2>
+    </ytd-comments-header-renderer>
+
+    <ytd-comment-renderer>
+      <div id="header-author">
+        <a id="author-text" href="/@dan">Dan</a>
+        <span id="published-time-text">5 hours ago</span>
+      </div>
+      <yt-attributed-string>
+        <span class="ytAttributedStringHost ytAttributedStringWhiteSpacePreWrap" dir="auto" role="text">Fallback main</span>
+      </yt-attributed-string>
+    </ytd-comment-renderer>
+
+    <ytd-comment-replies-renderer>
+      <ytd-comment-renderer>
+        <div id="header-author">
+          <a id="author-text" href="/@erin">Erin</a>
+          <span id="published-time-text">4 hours ago</span>
+        </div>
+        <yt-attributed-string>
+          <span class="ytAttributedStringHost ytAttributedStringWhiteSpacePreWrap" dir="auto" role="text">Fallback reply</span>
+        </yt-attributed-string>
+      </ytd-comment-renderer>
+    </ytd-comment-replies-renderer>
+  </ytd-comments>
+</body>
+</html>

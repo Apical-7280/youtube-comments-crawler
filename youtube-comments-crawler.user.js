@@ -1,14 +1,14 @@
 // ==UserScript==
 // @name         YouTube 评论抓取器
 // @namespace    https://github.com/Apical-7280/youtube-comments-crawler
-// @version      1.0.0
+// @version      1.1.0
 // @description  抓取 YouTube 视频页的全部评论：全量模式自动滚动并逐条展开回复，主评论模式只抓一级评论；支持断点续抓，导出 JSON / CSV
 // @author       Apical-7280
 // @license      MIT
 // @homepageURL  https://github.com/Apical-7280/youtube-comments-crawler
 // @supportURL   https://github.com/Apical-7280/youtube-comments-crawler/issues
-// @updateURL    https://raw.githubusercontent.com/Apical-7280/youtube-comments-crawler/main/youtube-comments-crawler.user.js
-// @downloadURL  https://raw.githubusercontent.com/Apical-7280/youtube-comments-crawler/main/youtube-comments-crawler.user.js
+// @updateURL    https://cdn.jsdelivr.net/gh/Apical-7280/youtube-comments-crawler@main/youtube-comments-crawler.user.js
+// @downloadURL  https://cdn.jsdelivr.net/gh/Apical-7280/youtube-comments-crawler@main/youtube-comments-crawler.user.js
 // @match        https://*.youtube.com/watch*
 // @match        https://*.youtube.com/shorts/*
 // @match        https://youtu.be/*
@@ -27,12 +27,17 @@
  *   4. 抓取完成后自动下载 JSON，也可随时导出 JSON / CSV。
  *
  * 全部数据仅在浏览器本地处理，脚本不发起任何外部网络请求。
+ *
+ * 更新地址使用 jsDelivr 镜像（部分网络无法直连 raw.githubusercontent.com）：
+ *   https://cdn.jsdelivr.net/gh/Apical-7280/youtube-comments-crawler@main/youtube-comments-crawler.user.js
  */
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '1.0.0';
+  const SCRIPT_VERSION = '1.1.0';
   const STORAGE_KEY = 'yt_comments_store_v1';
+  const KEY_SCHEME_COMMENT = 'comment'; // 新键方案：作者 + 时间 + 正文
+  const KEY_SCHEME_TEXT = 'text';       // v1 旧键方案：仅正文（载入旧数据时自动标记）
   const TICK_INTERVAL_MS = 1500;        // 每轮滚动与采集的间隔
   const MAX_IDLE_TICKS = 10;            // 连续无新增且无待展开回复的轮数，达到即判定抓取完成
   const MAX_TICKS = 40000;              // 循环轮数上限
@@ -41,8 +46,18 @@
   const SCROLL_RATIO = 0.5;             // 每轮滚动距离占视口高度的比例
   const COMMENT_TEXT_SELECTOR = 'span.ytAttributedStringHost.ytAttributedStringWhiteSpacePreWrap[dir="auto"][role="text"]';
   const COLLAPSED_TEXT_SELECTORS = ['ytd-comment-renderer #expand-content', '#expand-content'];
+  const PERSIST_INTERVAL_MS = 15000;    // 增量落盘的最小间隔（避免每轮都序列化整个存储）
+  const PERSIST_ITEM_THRESHOLD = 50;    // 新增条数达到该值即立刻落盘
+  const STORAGE_SOFT_LIMIT_BYTES = 4 * 1024 * 1024;  // 本地存储软上限，超过后提示导出
+
+  // 在 Node 中加载本文件（单元测试）时为 true，浏览器中恒为 false
+  const IS_NODE = typeof process === 'object' && process !== null
+    && typeof process.versions === 'object' && process.versions !== null
+    && typeof process.versions.node === 'string';
 
   let scrapeTimer = null;
+  let activeRun = null;    // { store, video }：抓取期间内存中的权威状态
+  let storageNotice = '';  // '' 正常 / 'near' 接近配额 / 'failed' 写入失败
 
   /* ------------------------------ 通用工具 ------------------------------ */
 
@@ -55,9 +70,19 @@
     .replace(/[ \t]*\r?\n[ \t]*/g, '\n')
     .trim();
 
+  // v1 的数据以评论正文作为键；载入时标记为旧键方案并继续沿用旧键，避免新旧键并存产生重复记录
+  const migrateStore = (store) => {
+    const videos = (store && store.videos) || {};
+    Object.keys(videos).forEach((videoId) => {
+      const video = videos[videoId];
+      if (video && !video.keyScheme) video.keyScheme = KEY_SCHEME_TEXT;
+    });
+    return store;
+  };
+
   const readStore = () => {
     try {
-      return JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null') || { videos: {} };
+      return migrateStore(JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null') || { videos: {} });
     } catch (error) {
       return { videos: {} };
     }
@@ -65,17 +90,41 @@
 
   const writeStore = (store) => {
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+      const serialized = JSON.stringify(store);
+      localStorage.setItem(STORAGE_KEY, serialized);
+      storageNotice = serialized.length > STORAGE_SOFT_LIMIT_BYTES ? 'near' : '';
+      return true;
     } catch (error) {
-      console.warn('[YouTube 评论抓取器] localStorage 写入失败，进度仅保留在内存中', error);
+      storageNotice = 'failed';
+      console.warn('[YouTube 评论抓取器] localStorage 写入失败，进度仅保留在内存中，建议立即导出 JSON', error);
+      return false;
     }
   };
 
-  const getVideoId = () => {
-    const watchMatch = location.search.match(/[?&]v=([\w-]{5,})/);
+  const getVideoId = (url) => {
+    const href = url || (typeof location !== 'undefined' ? location.href : '');
+    if (!href) return '';
+
+    let parsed;
+    try {
+      parsed = new URL(href);
+    } catch (error) {
+      return '';
+    }
+
+    const watchMatch = parsed.search.match(/[?&]v=([\w-]{5,})/);
     if (watchMatch) return watchMatch[1];
-    const shortMatch = location.pathname.match(/\/shorts\/([\w-]{5,})/);
-    return shortMatch ? shortMatch[1] : '';
+
+    const shortMatch = parsed.pathname.match(/\/shorts\/([\w-]{5,})/);
+    if (shortMatch) return shortMatch[1];
+
+    // youtu.be/ID：视频 id 位于路径根部（旧实现未覆盖，声明了 @match 却无法抓取）
+    if (/(^|\.)youtu\.be$/.test(parsed.hostname)) {
+      const idMatch = parsed.pathname.match(/^\/([\w-]{5,})/);
+      if (idMatch) return idMatch[1];
+    }
+
+    return '';
   };
 
   const getPageTitle = () => clean(document.title.replace(/ - YouTube\s*$/, ''));
@@ -91,7 +140,7 @@
     if (!text) return false;
     if (/^\d[\d,，、]*\s*条?\s*回复$/.test(text)) return true;
     if (/^(查看|显示)?\s*(\d[\d,]*|更多)\s*条?\s*回复$/.test(text)) return true;
-    if (/^\d[\d,]*\s*replies?$/i.test(text)) return true;
+    if (/^\d[\d,]*\s*repl(?:y|ies)$/i.test(text)) return true;
     if (/^(view|show)?\s*more\s+replies$/i.test(text)) return true;
     return false;
   };
@@ -113,9 +162,9 @@
     return rect.top < viewportHeight && rect.bottom > 0;
   };
 
-  const collectExpandButtons = () => {
+  const collectExpandButtons = (root = document) => {
     const result = [];
-    const buttons = document.querySelectorAll('button');
+    const buttons = root.querySelectorAll('button');
 
     buttons.forEach((button) => {
       if (isExpandRepliesLabel(getButtonLabel(button)) && isButtonActionable(button)) {
@@ -191,18 +240,19 @@
   };
 
   // 展开被折叠的长评论（全量模式下的补充处理，不影响正文完整性）
-  const expandCollapsedComments = (limit) => {
+  const expandCollapsedComments = (limit, root = document) => {
     const now = Date.now();
     let count = 0;
 
     for (let i = 0; i < COLLAPSED_TEXT_SELECTORS.length && count < limit; i += 1) {
-      const nodes = document.querySelectorAll(COLLAPSED_TEXT_SELECTORS[i]);
+      const nodes = root.querySelectorAll(COLLAPSED_TEXT_SELECTORS[i]);
       for (let j = 0; j < nodes.length && count < limit; j += 1) {
         const node = nodes[j];
         if (node.dataset) {
-          const mark = node.dataset.ytcMark;
+          // 使用独立标记，避免与回复按钮的 ytcMark 命名空间混用
+          const mark = node.dataset.ytcExpandMark;
           if (mark && now - Number(mark) < CLICK_COOLDOWN_MS) continue;
-          node.dataset.ytcMark = String(now);
+          node.dataset.ytcExpandMark = String(now);
         }
         try {
           node.click();
@@ -223,17 +273,53 @@
      mainOnly 为 true 时，每个线程只取第一条正文，即主评论。
   ----------------------------------------------------------------------- */
 
-  const collectComments = (mainOnly) => {
+  // 作者、发布时间、点赞数位于评论渲染器内部；取不到时留空，不影响正文抓取
+  const readCommentMeta = (span) => {
+    const renderer = (span.closest
+      && (span.closest('ytd-comment-renderer') || span.closest('ytd-comment-thread-renderer'))) || null;
+
+    const pick = (selector) => {
+      if (!renderer || !renderer.querySelector) return '';
+      const node = renderer.querySelector(selector);
+      return clean(node ? node.textContent : '');
+    };
+
+    return {
+      author: pick('#author-text'),
+      publishedAt: pick('#published-time-text') || pick('.published-time-text'),
+      likes: pick('#vote-count-middle'),
+      isReply: !!(span.closest && span.closest('ytd-comment-replies-renderer')),
+    };
+  };
+
+  // 评论唯一键：作者 + 时间 + 正文。
+  // 仅以正文为键会把不同用户的相同内容（纯 emoji、「谢谢分享」等）静默合并成一条。
+  // 取不到作者与时间时退回正文，与旧行为一致。
+  const buildCommentKey = (comment) => {
+    const text = comment.text || '';
+    if (!comment.author && !comment.publishedAt) return text;
+    return [comment.author, comment.publishedAt, text].join('\u0000');
+  };
+
+  const collectComments = (mainOnly, root = document) => {
     const result = [];
 
     const isBodySpan = (span) => !span.closest('yt-button-shape, yt-spec-button-shape, ytd-button-renderer, button');
 
     const pushSpan = (span) => {
       const text = cleanBody(span.textContent);
-      if (text) result.push({ text });
+      if (!text) return;
+      const meta = readCommentMeta(span);
+      result.push({
+        text,
+        author: meta.author,
+        publishedAt: meta.publishedAt,
+        likes: meta.likes,
+        isReply: meta.isReply,
+      });
     };
 
-    const threads = document.querySelectorAll('ytd-comment-thread-renderer');
+    const threads = root.querySelectorAll('ytd-comment-thread-renderer');
     if (threads.length > 0) {
       threads.forEach((thread) => {
         const spans = thread.querySelectorAll(COMMENT_TEXT_SELECTOR);
@@ -249,11 +335,13 @@
       return result;
     }
 
-    // 兜底：只采集评论区容器内的同类节点，排除评论区头部，避免误抓推荐列表等区域的文本
-    const spans = document.querySelectorAll('ytd-comments ' + COMMENT_TEXT_SELECTOR);
+    // 兜底：只采集评论区容器内的同类节点，排除评论区头部，避免误抓推荐列表等区域的文本。
+    // 主评论模式下排除回复容器内的节点（旧实现漏掉了这一步，会把回复一并抓走）。
+    const spans = root.querySelectorAll('ytd-comments ' + COMMENT_TEXT_SELECTOR);
     spans.forEach((span) => {
       if (span.closest('ytd-comments-header-renderer, ytd-comments #header')) return;
       if (!isBodySpan(span)) return;
+      if (mainOnly && span.closest('ytd-comment-replies-renderer')) return;
       pushSpan(span);
     });
 
@@ -271,6 +359,7 @@
         title: getPageTitle(),
         state: 'idle',
         mode: 'all',
+        keyScheme: KEY_SCHEME_COMMENT,
         items: {},
         order: [],
         updatedAt: Date.now(),
@@ -280,11 +369,23 @@
     return video;
   };
 
-  const findVideo = (videoId) => (readStore().videos || {})[videoId] || null;
+  // 抓取期间优先读取内存中的权威状态，避免落盘节流导致导出落后于实际进度
+  const findVideo = (videoId) => {
+    if (activeRun && activeRun.store.videos[videoId]) return activeRun.store.videos[videoId];
+    return (readStore().videos || {})[videoId] || null;
+  };
 
-  // 仅导出评论正文
+  // 导出字段：text 仍为首字段，其余为新增字段；v1 旧数据缺少这些字段时留空
+  const toExportItem = (item) => ({
+    text: item.text || '',
+    author: item.author || '',
+    publishedAt: item.publishedAt || '',
+    likes: item.likes || '',
+    isReply: !!item.isReply,
+  });
+
   const buildPayload = (video) => {
-    const items = (video.order || []).map((key) => ({ text: video.items[key].text }));
+    const items = (video.order || []).map((key) => toExportItem(video.items[key] || {}));
     return {
       crawledAt: new Date().toISOString(),
       videoId: video.videoId,
@@ -293,6 +394,18 @@
       total: items.length,
       items,
     };
+  };
+
+  const CSV_HEADER = ['text', 'author', 'publishedAt', 'likes', 'isReply'];
+
+  const buildCsv = (items) => {
+    const escapeCell = (value) => '"' + String(value == null ? '' : value).replace(/"/g, '""') + '"';
+    const rows = [CSV_HEADER.join(',')];
+    items.forEach((item) => {
+      const record = toExportItem(item);
+      rows.push(CSV_HEADER.map((field) => escapeCell(record[field])).join(','));
+    });
+    return rows.join('\r\n');
   };
 
   /* ------------------------------ 文件导出 ------------------------------ */
@@ -314,25 +427,25 @@
   };
 
   const saveCsv = (items, fileName) => {
-    const escapeCell = (value) => '"' + String(value == null ? '' : value).replace(/"/g, '""') + '"';
-    const rows = ['text'];
-    items.forEach((item) => rows.push(escapeCell(item.text)));
-    downloadBlob(new Blob(['\ufeff' + rows.join('\r\n')], { type: 'text/csv;charset=utf-8' }), fileName);
+    downloadBlob(new Blob(['\ufeff' + buildCsv(items)], { type: 'text/csv;charset=utf-8' }), fileName);
   };
 
   /* ------------------------------ 抓取主循环 ------------------------------ */
 
-  const stopScrape = (setStatus, video, state, message) => {
+  // store 与 current 由调用方传入内存中的权威状态，避免重新读盘丢掉尚未落盘的数据
+  const stopScrape = (setStatus, store, current, state, message) => {
     clearInterval(scrapeTimer);
     scrapeTimer = null;
 
-    const store = readStore();
-    const current = (video && store.videos[video.videoId]) || ensureVideo(store, getVideoId());
-    current.state = state;
-    current.updatedAt = Date.now();
-    writeStore(store);
+    if (current) {
+      current.state = state;
+      current.updatedAt = Date.now();
+    }
+    if (store) writeStore(store);
 
-    const count = current.order.length;
+    activeRun = null;
+
+    const count = current ? current.order.length : 0;
     setStatus(message + (count && state === 'done' ? `，已自动下载 JSON（${count} 条）` : ''));
     if (count && state === 'done') saveJson(buildPayload(current), `youtube_comments_${current.videoId}.json`);
   };
@@ -340,6 +453,13 @@
   const startScrape = (setStatus, reset, mainOnly) => {
     clearInterval(scrapeTimer);
     scrapeTimer = null;
+
+    // 切换任务前先把上一个任务尚未落盘的内存状态写回
+    if (activeRun && activeRun.video) {
+      activeRun.video.updatedAt = Date.now();
+      writeStore(activeRun.store);
+      activeRun = null;
+    }
 
     const videoId = getVideoId();
     if (!videoId) {
@@ -354,6 +474,7 @@
     if (reset) {
       video.items = {};
       video.order = [];
+      video.keyScheme = KEY_SCHEME_COMMENT;
     }
     video.state = 'running';
     video.mode = expandReplies ? 'all' : 'main';
@@ -362,19 +483,35 @@
     video.updatedAt = Date.now();
     writeStore(store);
 
+    // 内存中的权威状态：每轮不再读盘，避免落盘节流期间读到旧数据而丢进度
+    activeRun = { store, video };
+
     let tick = 0;
     let idle = 0;
     let lastHeight = 0;
     let emptyRounds = 0;
     let waitForExpand = 0;
+    let lastPersistAt = Date.now();
+    let lastPersistCount = video.order.length;
 
     setStatus(expandReplies ? '开始抓取全部评论' : '开始抓取主评论');
+
+    // 落盘节流：新增达到阈值或距上次落盘超过间隔时才序列化整个存储
+    const persistIfNeeded = () => {
+      const pendingItems = video.order.length - lastPersistCount;
+      if (pendingItems <= 0) return;
+      if (pendingItems < PERSIST_ITEM_THRESHOLD && Date.now() - lastPersistAt < PERSIST_INTERVAL_MS) return;
+
+      video.updatedAt = Date.now();
+      const saved = writeStore(store);
+      lastPersistAt = Date.now();
+      if (saved) lastPersistCount = video.order.length;
+    };
 
     scrapeTimer = setInterval(() => {
       tick += 1;
 
-      const latest = readStore();
-      const current = ensureVideo(latest, videoId);
+      const current = video;
       const before = current.order.length;
 
       // 每轮最多点击一个回复按钮：点击后先等待展开，再处理下一个。
@@ -391,7 +528,7 @@
       }
 
       collectComments(mainOnly).forEach((comment) => {
-        const key = comment.text;
+        const key = current.keyScheme === KEY_SCHEME_TEXT ? comment.text : buildCommentKey(comment);
         if (!current.items[key]) {
           current.items[key] = comment;
           current.order.push(key);
@@ -403,8 +540,7 @@
       idle = (after === before && height === lastHeight) ? idle + 1 : 0;
       lastHeight = height;
       emptyRounds = after === 0 ? emptyRounds + 1 : 0;
-      current.updatedAt = Date.now();
-      writeStore(latest);
+      persistIfNeeded();
 
       const pending = expandReplies ? countPendingReplies() : 0;
       const cooling = expandReplies ? countCoolingReplies() : 0;
@@ -421,11 +557,11 @@
 
       if (after === 0 && emptyRounds === 3) setStatus('正在滚动到评论区');
       if (after === 0 && emptyRounds >= 12) {
-        stopScrape(setStatus, current, 'error', '始终没有发现评论：评论可能已关闭、页面未加载评论区，或需要登录后再试');
+        stopScrape(setStatus, store, current, 'error', '始终没有发现评论：评论可能已关闭、页面未加载评论区，或需要登录后再试');
         return;
       }
       if (tick >= MAX_TICKS) {
-        stopScrape(setStatus, current, 'stopped', '已达循环轮数上限，已暂停，可点击「开始全量抓取」继续');
+        stopScrape(setStatus, store, current, 'stopped', '已达循环轮数上限，已暂停，可点击「开始全量抓取」继续');
         return;
       }
 
@@ -434,7 +570,7 @@
         if (expandReplies && pending > 0) {
           idle = 0;
         } else {
-          stopScrape(setStatus, current, 'done', expandReplies
+          stopScrape(setStatus, store, current, 'done', expandReplies
             ? `抓取完成，回复已全部展开并到达底部（共 ${after} 条）`
             : `抓取完成，主评论已抓完（共 ${after} 条）`);
           return;
@@ -462,13 +598,23 @@
     scrapeTimer = null;
 
     const videoId = getVideoId();
-    const store = readStore();
-    const video = store.videos[videoId];
+    let video = null;
 
-    if (video) {
+    if (activeRun && activeRun.store.videos[videoId]) {
+      // 停止时使用内存中的权威状态，保证最后几轮尚未落盘的评论也被保存
+      video = activeRun.store.videos[videoId];
       video.state = 'stopped';
       video.updatedAt = Date.now();
-      writeStore(store);
+      writeStore(activeRun.store);
+      activeRun = null;
+    } else {
+      const store = readStore();
+      video = store.videos[videoId] || null;
+      if (video) {
+        video.state = 'stopped';
+        video.updatedAt = Date.now();
+        writeStore(store);
+      }
     }
 
     setStatus(`已停止，已抓取 ${video ? video.order.length : 0} 条，进度已保留，可点击「开始全量抓取」继续`);
@@ -586,10 +732,51 @@
       const video = findVideo(getVideoId());
       const stored = video ? video.order.length : 0;
       const mode = video ? (video.mode === 'main' ? '（主评论）' : '（全量）') : '';
+      const base = `当前页已渲染评论线程 ${threadCount} 个，本视频已存 ${stored} 条${mode}`;
+
       videoLine.textContent = `视频 id：${getVideoId() || '未识别，无法抓取'}`;
-      hintLine.textContent = `当前页已渲染评论线程 ${threadCount} 个，本视频已存 ${stored} 条${mode}`;
+
+      if (storageNotice === 'failed') {
+        hintLine.textContent = `${base}｜本地存储写入失败，进度仅存于内存，请立即导出 JSON`;
+        hintLine.style.color = '#fa5151';
+      } else if (storageNotice === 'near') {
+        hintLine.textContent = `${base}｜本地存储接近上限，建议导出后清理`;
+        hintLine.style.color = '#fba53b';
+      } else {
+        hintLine.textContent = base;
+        hintLine.style.color = '#999';
+      }
     }, 1500);
   }
 
-  mount();
+  // 单元测试入口：在 Node 中 require 本文件时可访问内部函数；浏览器中始终走 mount()
+  if (IS_NODE && typeof module === 'object' && module !== null && module.exports) {
+    module.exports = {
+      SCRIPT_VERSION,
+      STORAGE_KEY,
+      STORAGE_SOFT_LIMIT_BYTES,
+      KEY_SCHEME_COMMENT,
+      KEY_SCHEME_TEXT,
+      clean,
+      cleanBody,
+      isExpandRepliesLabel,
+      getButtonLabel,
+      getVideoId,
+      collectExpandButtons,
+      expandCollapsedComments,
+      readCommentMeta,
+      buildCommentKey,
+      collectComments,
+      migrateStore,
+      readStore,
+      writeStore,
+      ensureVideo,
+      toExportItem,
+      buildPayload,
+      buildCsv,
+      getStorageNotice: () => storageNotice,
+    };
+  } else {
+    mount();
+  }
 })();
