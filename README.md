@@ -19,6 +19,14 @@
 2. 点击安装脚本：[youtube-comments-crawler.user.js](https://github.com/Apical-7280/youtube-comments-crawler/raw/main/youtube-comments-crawler.user.js)
 3. 也可以在脚本管理器中新建脚本，粘贴仓库中的源码
 
+若 `raw.githubusercontent.com` 无法访问，可使用 jsDelivr 镜像安装：
+
+```
+https://cdn.jsdelivr.net/gh/Apical-7280/youtube-comments-crawler@main/youtube-comments-crawler.user.js
+```
+
+镜像为缓存加速服务，版本更新可能有数小时延迟；能直连 GitHub 时建议使用上方原始地址。
+
 ## 使用
 
 1. 打开任意 YouTube 视频页面，等待评论区开始加载
